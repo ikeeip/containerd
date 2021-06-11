@@ -211,6 +211,22 @@ func (in *instrumentedService) ContainerStatus(ctx context.Context, r *runtime.C
 	return res, errdefs.ToGRPC(err)
 }
 
+// SubscribeContainerEvent
+func (in *instrumentedService) SubscribeContainerEvent(r *runtime.SubscribeContainerEventRequest, srv runtime.RuntimeService_SubscribeContainerEventServer) (err error) {
+	if err := in.checkInitialized(); err != nil {
+		return err
+	}
+	ctx := srv.Context()
+	log.G(ctx).Tracef("SubscribeContainerEvent")
+	defer func() {
+		if err != nil {
+			log.G(ctx).WithError(err).Errorf("SubscribeContainerEvent failed")
+		}
+	}()
+	err = in.c.SubscribeContainerEvent(r, srv)
+	return errdefs.ToGRPC(err)
+}
+
 func (in *instrumentedService) StopContainer(ctx context.Context, r *runtime.StopContainerRequest) (res *runtime.StopContainerResponse, err error) {
 	if err := in.checkInitialized(); err != nil {
 		return nil, err

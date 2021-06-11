@@ -70,7 +70,7 @@ func (c *criService) stopContainer(ctx context.Context, container containerstore
 		}
 		// Don't return for unknown state, some cleanup needs to be done.
 		if state == runtime.ContainerState_CONTAINER_UNKNOWN {
-			return cleanupUnknownContainer(ctx, id, container)
+			return cleanupUnknownContainer(ctx, id, container, c.eventMonitor.exchange)
 		}
 		return nil
 	}
@@ -85,11 +85,11 @@ func (c *criService) stopContainer(ctx context.Context, container containerstore
 			if !errdefs.IsNotFound(err) {
 				return errors.Wrapf(err, "failed to wait for task for %q", id)
 			}
-			return cleanupUnknownContainer(ctx, id, container)
+			return cleanupUnknownContainer(ctx, id, container, c.eventMonitor.exchange)
 		}
 
 		exitCtx, exitCancel := context.WithCancel(context.Background())
-		stopCh := c.eventMonitor.startContainerExitMonitor(exitCtx, id, task.Pid(), exitCh)
+		stopCh := c.eventMonitor.startContainerExitMonitor(exitCtx, id, task.Pid(), exitCh, c.eventMonitor.exchange)
 		defer func() {
 			exitCancel()
 			// This ensures that exit monitor is stopped before
@@ -188,7 +188,7 @@ func (c *criService) waitContainerStop(ctx context.Context, container containers
 }
 
 // cleanupUnknownContainer cleanup stopped container in unknown state.
-func cleanupUnknownContainer(ctx context.Context, id string, cntr containerstore.Container) error {
+func cleanupUnknownContainer(ctx context.Context, id string, cntr containerstore.Container, exchange *exchange) error {
 	// Reuse handleContainerExit to do the cleanup.
 	return handleContainerExit(ctx, &eventtypes.TaskExit{
 		ContainerID: id,
@@ -196,5 +196,5 @@ func cleanupUnknownContainer(ctx context.Context, id string, cntr containerstore
 		Pid:         0,
 		ExitStatus:  unknownExitCode,
 		ExitedAt:    time.Now(),
-	}, cntr)
+	}, cntr, exchange)
 }

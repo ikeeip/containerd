@@ -100,6 +100,8 @@ func (c *criService) RemoveContainer(ctx context.Context, r *runtime.RemoveConta
 
 	c.containerNameIndex.ReleaseByKey(id)
 
+	c.eventMonitor.exchange.publish(context.Background(), buildContainerEventMessageFromContainer(&container, runtime.ContainerEventMessage_ContainerDeleted))
+
 	return &runtime.RemoveContainerResponse{}, nil
 }
 

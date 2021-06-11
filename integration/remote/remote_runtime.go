@@ -360,6 +360,11 @@ func (r *RuntimeService) ContainerStatus(containerID string) (*runtimeapi.Contai
 	return resp.Status, nil
 }
 
+func (r *RuntimeService) SubscribeContainerEvent(requestLabels, requestAnnotations []string) (internalapi.ContainerEventsWatchInterface, error) {
+	// TODO: fixme!
+	return nil, errors.New("not implemented")
+}
+
 // UpdateContainerResources updates a containers resource config
 func (r *RuntimeService) UpdateContainerResources(containerID string, resources *runtimeapi.LinuxContainerResources) error {
 	klog.V(10).Infof("[RuntimeService] UpdateContainerResources (containerID=%v, timeout=%v)", containerID, r.timeout)

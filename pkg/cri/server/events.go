@@ -26,6 +26,7 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/events"
 	"github.com/containerd/typeurl"
+	goevents "github.com/docker/go-events"
 	gogotypes "github.com/gogo/protobuf/types"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -37,6 +38,7 @@ import (
 	containerstore "github.com/containerd/containerd/pkg/cri/store/container"
 	sandboxstore "github.com/containerd/containerd/pkg/cri/store/sandbox"
 	ctrdutil "github.com/containerd/containerd/pkg/cri/util"
+	runtime "k8s.io/cri-api/pkg/apis/runtime/v1alpha2"
 )
 
 const (
@@ -54,12 +56,13 @@ const (
 
 // eventMonitor monitors containerd event and updates internal state correspondingly.
 type eventMonitor struct {
-	c       *criService
-	ch      <-chan *events.Envelope
-	errCh   <-chan error
-	ctx     context.Context
-	cancel  context.CancelFunc
-	backOff *backOff
+	c        *criService
+	ch       <-chan *events.Envelope
+	errCh    <-chan error
+	ctx      context.Context
+	cancel   context.CancelFunc
+	backOff  *backOff
+	exchange *exchange
 }
 
 type backOff struct {
@@ -83,15 +86,20 @@ type backOffQueue struct {
 	clock      clock.Clock
 }
 
+type exchange struct {
+	broadcaster *goevents.Broadcaster
+}
+
 // Create new event monitor. New event monitor will start subscribing containerd event. All events
 // happen after it should be monitored.
 func newEventMonitor(c *criService) *eventMonitor {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &eventMonitor{
-		c:       c,
-		ctx:     ctx,
-		cancel:  cancel,
-		backOff: newBackOff(),
+		c:        c,
+		ctx:      ctx,
+		cancel:   cancel,
+		backOff:  newBackOff(),
+		exchange: newExchange(),
 	}
 }
 
@@ -107,7 +115,7 @@ func (em *eventMonitor) subscribe(subscriber events.Subscriber) {
 }
 
 // startSandboxExitMonitor starts an exit monitor for a given sandbox.
-func (em *eventMonitor) startSandboxExitMonitor(ctx context.Context, id string, pid uint32, exitCh <-chan containerd.ExitStatus) <-chan struct{} {
+func (em *eventMonitor) startSandboxExitMonitor(ctx context.Context, id string, pid uint32, exitCh <-chan containerd.ExitStatus, exchange *exchange) <-chan struct{} {
 	stopCh := make(chan struct{})
 	go func() {
 		defer close(stopCh)
@@ -137,7 +145,7 @@ func (em *eventMonitor) startSandboxExitMonitor(ctx context.Context, id string, 
 
 				sb, err := em.c.sandboxStore.Get(e.ID)
 				if err == nil {
-					if err := handleSandboxExit(dctx, e, sb); err != nil {
+					if err := handleSandboxExit(dctx, e, sb, exchange); err != nil {
 						return err
 					}
 					return nil
@@ -158,7 +166,7 @@ func (em *eventMonitor) startSandboxExitMonitor(ctx context.Context, id string, 
 }
 
 // startContainerExitMonitor starts an exit monitor for a given container.
-func (em *eventMonitor) startContainerExitMonitor(ctx context.Context, id string, pid uint32, exitCh <-chan containerd.ExitStatus) <-chan struct{} {
+func (em *eventMonitor) startContainerExitMonitor(ctx context.Context, id string, pid uint32, exitCh <-chan containerd.ExitStatus, exchange *exchange) <-chan struct{} {
 	stopCh := make(chan struct{})
 	go func() {
 		defer close(stopCh)
@@ -188,7 +196,7 @@ func (em *eventMonitor) startContainerExitMonitor(ctx context.Context, id string
 
 				cntr, err := em.c.containerStore.Get(e.ID)
 				if err == nil {
-					if err := handleContainerExit(dctx, e, cntr); err != nil {
+					if err := handleContainerExit(dctx, e, cntr, exchange); err != nil {
 						return err
 					}
 					return nil
@@ -314,22 +322,24 @@ func (em *eventMonitor) handleEvent(any interface{}) error {
 		// Use ID instead of ContainerID to rule out TaskExit event for exec.
 		cntr, err := em.c.containerStore.Get(e.ID)
 		if err == nil {
-			if err := handleContainerExit(ctx, e, cntr); err != nil {
+			if err := handleContainerExit(ctx, e, cntr, em.exchange); err != nil {
 				return errors.Wrap(err, "failed to handle container TaskExit event")
 			}
-			return nil
+			return em.exchange.publish(ctx, buildContainerEventMessageFromContainer(&cntr, runtime.ContainerEventMessage_ContainerStopped))
 		} else if err != store.ErrNotExist {
 			return errors.Wrap(err, "can't find container for TaskExit event")
 		}
 		sb, err := em.c.sandboxStore.Get(e.ID)
 		if err == nil {
-			if err := handleSandboxExit(ctx, e, sb); err != nil {
+			if err := handleSandboxExit(ctx, e, sb, em.exchange); err != nil {
 				return errors.Wrap(err, "failed to handle sandbox TaskExit event")
 			}
-			return nil
+			return em.exchange.publish(ctx, buildContainerEventMessageFromSandbox(&sb, runtime.ContainerEventMessage_ContainerStopped))
+
 		} else if err != store.ErrNotExist {
 			return errors.Wrap(err, "can't find sandbox for TaskExit event")
 		}
+
 		return nil
 	case *eventtypes.TaskOOM:
 		logrus.Infof("TaskOOM event %+v", e)
@@ -348,6 +358,8 @@ func (em *eventMonitor) handleEvent(any interface{}) error {
 		if err != nil {
 			return errors.Wrap(err, "failed to update container status for TaskOOM event")
 		}
+
+		return em.exchange.publish(ctx, buildContainerEventMessageFromContainer(&cntr, runtime.ContainerEventMessage_ContainerStopped))
 	case *eventtypes.ImageCreate:
 		logrus.Infof("ImageCreate event %+v", e)
 		return em.c.updateImage(ctx, e.Name)
@@ -363,7 +375,7 @@ func (em *eventMonitor) handleEvent(any interface{}) error {
 }
 
 // handleContainerExit handles TaskExit event for container.
-func handleContainerExit(ctx context.Context, e *eventtypes.TaskExit, cntr containerstore.Container) error {
+func handleContainerExit(ctx context.Context, e *eventtypes.TaskExit, cntr containerstore.Container, exchange *exchange) error {
 	// Attach container IO so that `Delete` could cleanup the stream properly.
 	task, err := cntr.Container.Task(ctx,
 		func(*containerdio.FIFOSet) (containerdio.IO, error) {
@@ -412,11 +424,13 @@ func handleContainerExit(ctx context.Context, e *eventtypes.TaskExit, cntr conta
 	}
 	// Using channel to propagate the information of container stop
 	cntr.Stop()
+
+	exchange.publish(ctx, buildContainerEventMessageFromContainer(&cntr, runtime.ContainerEventMessage_ContainerStopped))
 	return nil
 }
 
 // handleSandboxExit handles TaskExit event for sandbox.
-func handleSandboxExit(ctx context.Context, e *eventtypes.TaskExit, sb sandboxstore.Sandbox) error {
+func handleSandboxExit(ctx context.Context, e *eventtypes.TaskExit, sb sandboxstore.Sandbox, exchange *exchange) error {
 	// No stream attached to sandbox container.
 	task, err := sb.Container.Task(ctx, nil)
 	if err != nil {
@@ -442,6 +456,8 @@ func handleSandboxExit(ctx context.Context, e *eventtypes.TaskExit, sb sandboxst
 	}
 	// Using channel to propagate the information of sandbox stop
 	sb.Stop()
+
+	exchange.publish(ctx, buildContainerEventMessageFromSandbox(&sb, runtime.ContainerEventMessage_ContainerStopped))
 	return nil
 }
 
@@ -539,4 +555,79 @@ func newBackOffQueue(events []interface{}, init time.Duration, c clock.Clock) *b
 func (q *backOffQueue) isExpire() bool {
 	// return time.Now >= expireTime
 	return !q.clock.Now().Before(q.expireTime)
+}
+
+type Mutator func(event goevents.Event) goevents.Event
+
+type MutatorSink struct {
+	dst     goevents.Sink
+	mutator Mutator
+	closed  bool
+}
+
+func newMutatorSink(dst goevents.Sink, mutator Mutator) goevents.Sink {
+	return &MutatorSink{dst: dst, mutator: mutator}
+}
+
+func (ms *MutatorSink) Write(event goevents.Event) error {
+	if ms.closed {
+		return goevents.ErrSinkClosed
+	}
+	return ms.dst.Write(ms.mutator(event))
+}
+
+func (ms *MutatorSink) Close() error {
+	if ms.closed {
+		return nil
+	}
+
+	ms.closed = true
+	return ms.dst.Close()
+}
+
+func newExchange() *exchange {
+	return &exchange{
+		broadcaster: goevents.NewBroadcaster(),
+	}
+}
+
+func (e *exchange) publish(ctx context.Context, event goevents.Event) error {
+	return e.broadcaster.Write(event)
+}
+
+func (e *exchange) subscribe(ctx context.Context, mutator Mutator) (*goevents.Channel, error) {
+	channel := goevents.NewChannel(0)
+	e.broadcaster.Add(newMutatorSink(channel, mutator))
+	return channel, nil
+}
+
+func (e *exchange) unsubscribe(channel *goevents.Channel) {
+	e.broadcaster.Remove(channel)
+	channel.Close()
+}
+
+func buildContainerEventMessageFromContainer(
+	cntr *containerstore.Container,
+	eventType runtime.ContainerEventMessage_EventType,
+) runtime.ContainerEventMessage {
+	return runtime.ContainerEventMessage{
+		ContainerId: cntr.ID,
+		SandboxId:   cntr.SandboxID,
+		EventType:   eventType,
+		Labels:      cntr.Config.GetLabels(),
+		Annotations: cntr.Config.GetAnnotations(),
+	}
+}
+
+func buildContainerEventMessageFromSandbox(
+	sb *sandboxstore.Sandbox,
+	eventType runtime.ContainerEventMessage_EventType,
+) runtime.ContainerEventMessage {
+	return runtime.ContainerEventMessage{
+		ContainerId: sb.ID,
+		SandboxId:   sb.ID,
+		EventType:   eventType,
+		Labels:      sb.Config.GetLabels(),
+		Annotations: sb.Config.GetAnnotations(),
+	}
 }

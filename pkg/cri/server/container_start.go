@@ -160,7 +160,7 @@ func (c *criService) StartContainer(ctx context.Context, r *runtime.StartContain
 	}
 
 	// It handles the TaskExit event and update container state after this.
-	c.eventMonitor.startContainerExitMonitor(context.Background(), id, task.Pid(), exitCh)
+	c.eventMonitor.startContainerExitMonitor(context.Background(), id, task.Pid(), exitCh, c.eventMonitor.exchange)
 
 	return &runtime.StartContainerResponse{}, nil
 }

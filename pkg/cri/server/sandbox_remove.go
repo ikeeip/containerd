@@ -111,5 +111,7 @@ func (c *criService) RemovePodSandbox(ctx context.Context, r *runtime.RemovePodS
 	// Release the sandbox name reserved for the sandbox.
 	c.sandboxNameIndex.ReleaseByKey(id)
 
+	c.eventMonitor.exchange.publish(context.Background(), buildContainerEventMessageFromSandbox(&sandbox, runtime.ContainerEventMessage_ContainerDeleted))
+
 	return &runtime.RemovePodSandboxResponse{}, nil
 }
